@@ -12,6 +12,7 @@
 
 #include <vector>
 #include <map>
+#include <mutex>
 #include "Gamma/Allocator.h"
 #include "Gamma/Conversion.h"
 #include "Gamma/mem.h"
@@ -195,6 +196,7 @@ public:
 
 	/// Returns number of pointers to memory address being managed
 	static int references(T* m){
+		std::lock_guard<std::recursive_mutex> lk(refCountMutex()); // UA PATCH
 		typename RefCount::const_iterator it = refCount().find(m);
 		return it != refCount().end() ? it->second : 0;
 	}
@@ -210,6 +212,16 @@ protected:
 	static RefCount& refCount(){
 		static RefCount * o = new RefCount;
 		return *o;
+	}
+
+	// UA PATCH: serialize all access to the global refCount() map. gam arrays are
+	// allocated/freed from BOTH the audio thread (effect buffer resize/maxDelay) and
+	// the message thread (effect construct/destroy on preset load). The std::map above
+	// is otherwise unsynchronized; concurrent mutation corrupts its red-black tree.
+	// Recursive because the guarded operations nest (resize->clear->managing->references).
+	static std::recursive_mutex& refCountMutex(){
+		static std::recursive_mutex * m = new std::recursive_mutex;
+		return *m;
 	}
 
 	// Is memory being managed (allocated/freed) automatically?
@@ -485,7 +497,9 @@ bool ArrayBase<T,S,A>::empty() const { return !mData || size()==0; }
 template <class T, class S, class A>
 void ArrayBase<T,S,A>::clear(){ //printf("ArrayBase::clear(): mData=%p\n", mData);
 
-	// We will only attempt to deallocate the data if it exists and is being 
+	std::lock_guard<std::recursive_mutex> lk(refCountMutex()); // UA PATCH
+
+	// We will only attempt to deallocate the data if it exists and is being
 	// managed (reference counted) by ArrayBase.
 	if(mData && managing(mData)){
 		int& c = refCount()[mData];
@@ -558,7 +572,10 @@ void ArrayBase<T,S,A>::resize(uint32_t newSize, const T& c){
 			clear();
 			mData = newData;
 
-			refCount()[mData] = 1;
+			{
+				std::lock_guard<std::recursive_mutex> lk(refCountMutex()); // UA PATCH
+				refCount()[mData] = 1;
+			}
 			mSize(newSize);
 			onResize();
 		}
@@ -584,6 +601,7 @@ bool ArrayBase<T,S,A>::source(T * src, uint32_t size, bool unmanaged){
 	if(src == mData) return false; // check for self assignment
 	if(false==unmanaged){
 		clear();
+		std::lock_guard<std::recursive_mutex> lk(refCountMutex()); // UA PATCH
 		if(managing(src)){
 			++refCount()[src];
 		}
