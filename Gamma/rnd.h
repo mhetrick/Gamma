@@ -17,14 +17,56 @@
 namespace gam{
 
 namespace rnd{	
+
+	/// UA PATCH: process-wide seed override, for reproducible renders.
+	///
+	/// Zero (the default) keeps the historical behaviour exactly: seed from the
+	/// wall clock, so every run differs. A non-zero value makes getSeed()
+	/// deterministic, which is what an A/B render harness needs -- without it the
+	/// same preset rendered twice produces different audio and a regression is
+	/// indistinguishable from run-to-run variance.
+	///
+	/// Set it BEFORE constructing anything that owns an RNG. Generators seed
+	/// themselves at construction, so a value set afterwards does not reach them.
+	///
+	/// WHY AN inline FUNCTION AND NOT A static VARIABLE: getSeed() below is
+	/// `static` in a header, so it has internal linkage and every translation
+	/// unit gets its OWN copy of its statics -- around 26 of them across uasimdsp
+	/// alone. A `static` override would likewise be per-TU: set in one .cpp and
+	/// invisible everywhere else, so the fix would silently do nothing in most of
+	/// the codebase. An inline function's function-local static is one instance
+	/// across the whole program, which is the property actually needed here.
+	inline uint32_t& seedOverride(){
+		static uint32_t v = 0;
+		return v;
+	}
+
+	/// Set the process-wide seed. 0 restores time-based (non-reproducible) seeding.
+	inline void setGlobalSeed(uint32_t v){ seedOverride() = v; }
+
 	/// Get a random seed
 	static uint32_t getSeed(){
 		static gen::RMulAdd<uint32_t> seedGen(1664525, 1013904223);
 		static bool initSeed = true;
-		if(initSeed){
+
+		// The override is re-checked on EVERY call, not just the first, and it
+		// restarts the sequence from a known point. That is deliberate and is the
+		// only thing that works here: rnd.h declares `static RNGTaus gen(getSeed())`
+		// at namespace scope, so every translation unit including this header runs
+		// a getSeed() call during static initialisation -- BEFORE main(). A
+		// first-use-only check is therefore always consumed pre-main, and a seed
+		// set from main() would never be seen. Verified: with a first-use-only
+		// check, getSeed() still returned different values run to run.
+		static uint32_t appliedOverride = 0;
+		if(seedOverride() && seedOverride() != appliedOverride){
+			appliedOverride = seedOverride();
+			seedGen.val = appliedOverride;
+			initSeed = false;
+		}
+		else if(initSeed){
 			seedGen.val = uint32_t(std::time(NULL));
 			initSeed = false;
-		} 
+		}
 		return seedGen();
 	}
 } // rnd::
@@ -229,7 +271,25 @@ namespace rnd{
 	/// be passed in.
 	template <class T> uint32_t weighted(T * weights, uint32_t num, T weightsSum=(T)1);
 	
-	static RNGTaus gen(rnd::getSeed());	///< Shared RNG
+	/// The one shared RNG instance, program-wide.
+	///
+	/// UA PATCH: `gen` was `static RNGTaus gen(rnd::getSeed());`. At namespace scope
+	/// in a header that is INTERNAL LINKAGE, so every translation unit got its OWN
+	/// copy, each constructed during static initialisation (before main). Two
+	/// consequences: rnd::seed() could only ever seed the calling TU's copy -- so
+	/// uasimdsp's copy kept its wall-clock seed and UASpectralStriker::randomize()
+	/// (via rnd::uni()) stayed non-deterministic -- and the copies were seeded from
+	/// the clock independently.
+	///
+	/// An inline function's function-local static is ONE instance across the whole
+	/// program, and it is constructed on first use rather than pre-main. `gen` below
+	/// is a reference to it, so all 24 existing use sites are unchanged and there is
+	/// no macro to leak into including code.
+	inline RNGTaus& genInstance(){
+		static RNGTaus g(rnd::getSeed());
+		return g;
+	}
+	static RNGTaus& gen = genInstance();	///< Shared RNG
 }
 
 
