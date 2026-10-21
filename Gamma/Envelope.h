@@ -638,7 +638,7 @@ public:
 
 	/// Set length, in domain units
 	Seg& length(Tp v){
-		return v > Tp(Td::ups()) ? freq(Tp(1)/v) : freq(Td::spu());
+		return freq(Tp(1)/scl::max(v, Tp(1e-8)));
 	}
 
 	/// Set length, in domain units
